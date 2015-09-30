@@ -19,11 +19,56 @@ Once we had our webserver successfully making persistent connections with client
 After developing our broadcasters using Atmospheres Redis example I had things running very well and broadcasting messages from many different JVMs.
 
 ## Testing
-After a few iterations of frontend updates around our old notification code the WebSocket implementation went live in a QA environment and everything broke down. Publishes were happening on our redis instance and nothing was picking them up. Some users would get messages and some would not. Frustrating to say the least. After a few code updates to put in massive amounts of debug logging I finally started to get a picture of what was going on.  The 
+After a few iterations of frontend updates around our old notification code the WebSocket implementation went live in a QA environment and everything broke down. Publishes were happening on our redis instance and nothing was picking them up. Some users would get messages and some would not. Frustrating to say the least. After a few code updates to put in massive amounts of debug logging I finally started to get a picture of what was going on.  The Jedis.subscribe method was a blocking method, this didn't allow the broadcaster to properly finish subscribing the client. I had blindly trusted a 3rd party example of connecting to another resource without cross referencing a few other examples of how that resource says it should be connecting to.
 
-TODO: Talk about how I decided upon Atmoshpere.
+After researching some Jedis pubsub examples and looking at the HazelcastBroadcaster implementation I finally had a better idea on how subscribing to rooms within Redis.
 
+I extracted the JedisPubSub annoymous class into its own class in their example and then started the subscribe in a new thread.
 
+```
+this.subscriber = new JedisSubscriber(RedisUtil.this.callback);
+		new Thread() {
+			@Override
+			public void run() {
+				try {
+					RedisUtil.this.subscribeClient.subscribe(RedisUtil.this.subscriber, RedisUtil.this.callback.getID());
+					LOG.debug("Subscription ended for " + RedisUtil.this.callback.getID());
+
+				} catch (Throwable t) {
+					LOG.error("Error subscribing to redis channel", t);
+				}
+				RedisUtil.this.callback.subscriptionEnded();
+			};
+		}.start();
+```
+
+ When this subscription ended (or threw an exception) I would then trigger a method on the Broadcaster callback that checked to see if I still had any resources still listening and if so re-subscribe.
+ 
+ ```
+	private void refreshMessageListener() {
+		synchronized (this.redisUtil) {
+			if (getAtmosphereResources().size() > 0 && !this.redisUtil.isSubscriberConnected()) {
+				this.redisUtil.startSubscriber();
+
+				LOG.debug("Started redis subscriber on room " + getID());
+			} else if (getAtmosphereResources().size() == 0) {
+				this.redisUtil.stopSubscriber();
+
+				LOG.debug("Stoped redis subscriber on room " + getID());
+			} else if (LOG.isDebugEnabled()) {
+				LOG.debug("Did not add message listener because resources:" + getAtmosphereResources().size());
+			}
+		}
+	}
+```
+
+This same `refreshMessageListener` also got called any time an atmosphere resource was added or removed via the `addAtmosphereResource` and `removeAtmosphereResource` methods causing the subscription to never be stagnant or get tore down if no clients were wanting messages from that room.
+
+## Result
+After these changes to our Broadcaster/Pubsub mediums things went much smoother.  It was pretty awesome watching things happen in completely different JVMs and on completion they showed up immediately to clients. Where does this lead us in the road ahead? Having records come into a back-channel datasource and appearing in the clients view as soon as they do? Live feeds of email campaigns as they stream through our system? Being able to watch a singular campaign stream in with the volume steadily increasing as we process more data from it? With this model the possibilities are only limited by the dev time we wish to invest.
+
+## Retrospect
+In hindsight the main thing I learned by this experience was to cross reference 3rd parties samples of talking to other datasources before taking them as gold. Most of the time these are just examples on how to start your implementation and go from there. If I would have done this in the beginning the mistakes would have been obvious and the QA/debugging process would have been much less painful.
 
 
 
